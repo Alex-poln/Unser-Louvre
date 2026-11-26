@@ -12,6 +12,10 @@ const ROOM_PREVIEW_RADIUS = 11;
 const ROOM_PREVIEW_PHOTOS = 4;
 const MAX_ROOM_PREVIEW_LOADS = 2;
 const MAX_PREPARED_FRAMES = 6;
+const PHOTO_AHEAD_RADIUS = 43;
+const PHOTO_BEHIND_RADIUS = 23;
+const PHOTO_KEEP_MARGIN = 5;
+const PHOTO_FADE_SECONDS = .32;
 
 export function createMuseum(host,rows,onSelect,onPlace,editor={}){
  const renderer=new T.WebGLRenderer({antialias:true,powerPreference:'high-performance'});renderer.setPixelRatio(editor.architecture?devicePixelRatio:Math.min(devicePixelRatio,1.5));renderer.outputColorSpace=T.SRGBColorSpace;host.append(renderer.domElement);renderer.domElement.tabIndex=0;renderer.domElement.setAttribute('aria-label','Louvre Museum: WASD zum Laufen, ziehen zum Umschauen');
@@ -23,6 +27,7 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
  }
  let resizeTimer,visualDirty=true,wasMoving=false;
  const frames = new Map();
+ const fadingFrames = new Set();
  const requestedPhotos = new Set();
  const textureLoader = new T.TextureLoader();
  let exhibitionLayout = null, gallerySlots = [], streamedZ = null, activeLoads = 0;
@@ -138,6 +143,24 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
  function demoTexture(index){const c=document.createElement('canvas');c.width=480;c.height=360;const ctx=c.getContext('2d'),colors=['#759a8a','#c3a16a','#b9755d','#829ab1'];ctx.fillStyle='#e8ddc4';ctx.fillRect(0,0,480,360);ctx.fillStyle=colors[Math.floor(index/80)%4];ctx.beginPath();ctx.arc(335,105,65,0,Math.PI*2);ctx.fill();ctx.fillStyle='#2b4b43';ctx.beginPath();ctx.moveTo(0,360);ctx.lineTo(190,100);ctx.lineTo(390,360);ctx.fill();ctx.fillStyle='#c3b18c';ctx.beginPath();ctx.moveTo(200,360);ctx.lineTo(380,160);ctx.lineTo(480,360);ctx.fill();ctx.fillStyle='#344b40';ctx.font='15px Georgia';ctx.fillText('NOTRE HISTOIRE / '+String(index+1).padStart(3,'0'),22,30);const t=new T.CanvasTexture(c);t.colorSpace=T.SRGBColorSpace;return t;}
 
  let gold, cream;
+ function mountPermanentFrames(slots) {
+   if (!slots.length) return;
+   const borderGeometry = new T.BoxGeometry(3.1, 2.5, .15);
+   const matGeometry = new T.BoxGeometry(2.87, 2.27, .09);
+   const borders = new T.InstancedMesh(borderGeometry, gold, slots.length);
+   const mats = new T.InstancedMesh(matGeometry, cream, slots.length);
+   borders.name = 'Permanent frame borders';
+   mats.name = 'Permanent frame mats';
+   const transform = new T.Matrix4(), offset = new T.Matrix4().makeTranslation(0, 0, .1);
+   slots.forEach((pose, i) => {
+     transform.makeRotationY(pose.rotation).setPosition(pose.x, 2.6, pose.z);
+     borders.setMatrixAt(i, transform);
+     mats.setMatrixAt(i, transform.multiply(offset));
+   });
+   scene.add(borders, mats);
+   resources.push(borderGeometry, matGeometry, borders, mats);
+ }
+
  function mountFrame(position) {
    const slot = gallerySlots[position];
    const row = rows[slot.index];
@@ -147,9 +170,16 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
    group.rotation.y = pose.rotation;
    scene.add(group);
    const owned = [];
-   box(3.1, 2.5, .15, gold, 0, 0, 0, group, owned);
-   box(2.87, 2.27, .09, cream, 0, 0, .1, group, owned);
+   if (!architecture) {
+     box(3.1, 2.5, .15, gold, 0, 0, 0, group, owned);
+     box(2.87, 2.27, .09, cream, 0, 0, .1, group, owned);
+   }
    const material = mat('#e5dbc3', {}, owned);
+   if (architecture && row.image_path) {
+     material.transparent = true;
+     material.opacity = 0;
+     material.depthWrite = false;
+   }
    const geometry = new T.PlaneGeometry(2.65, 2);
    owned.push(geometry);
    const art = new T.Mesh(geometry, material);
@@ -166,7 +196,7 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
    const prepared = architecture && preparedFrames.get(row.id);
    if (prepared?.ready) {
      preparedFrames.delete(row.id);
-     applyPhoto(entry, prepared.ready);
+     applyPhoto(entry, prepared.ready, false);
      entry.queued = false;
      requestedPhotos.add(position);
    }
@@ -175,6 +205,7 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
 
  function unmountFrame(position, entry) {
    frames.delete(position);
+   fadingFrames.delete(entry);
    entry.group.removeFromParent();
    entry.owned.forEach(resource => resource.dispose());
  }
@@ -206,12 +237,26 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
    }
  }
 
- function applyPhoto(entry, photo) {
+ function applyPhoto(entry, photo, fade = Boolean(architecture)) {
    const {art} = entry;
    entry.owned.push(photo.texture);
    art.material.map = photo.texture;
+   if (architecture) {
+     art.material.opacity = fade ? 0 : 1;
+     if (fade) fadingFrames.add(entry);
+   }
    art.material.needsUpdate = true;
    art.scale.set(Math.min(1, photo.ratio), Math.min(1, 1 / photo.ratio), 1);
+   visualDirty = true;
+ }
+
+ function advancePhotoFades(dt) {
+   if (!fadingFrames.size) return;
+   for (const entry of fadingFrames) {
+     const material = entry.art.material;
+     material.opacity = Math.min(1, material.opacity + dt / PHOTO_FADE_SECONDS);
+     if (material.opacity >= 1) fadingFrames.delete(entry);
+   }
    visualDirty = true;
  }
 
@@ -311,7 +356,8 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
 
  function schedulePhotos() {
    if (!exhibitionLayout || disposed) return;
-   for (const position of orderedForTravel(nearbyFrames(exhibitionLayout, player.z))) {
+   const visibleCandidates = architecture ? [...frames.keys()] : nearbyFrames(exhibitionLayout, player.z);
+   for (const position of orderedForTravel(visibleCandidates)) {
      if (activeLoads + backgroundLoads + previewLoads >= MAX_PHOTO_LOADS) return;
      const entry = frames.get(position);
      if (entry?.queued) void loadFramePhoto(position, entry);
@@ -325,17 +371,26 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
    }
  }
 
+ function insidePhotoWindow(position, margin = 0) {
+   const offset = (exhibitionLayout.slots[position].z - player.z) * travelDirection;
+   return offset <= PHOTO_AHEAD_RADIUS + margin && offset >= -PHOTO_BEHIND_RADIUS - margin;
+ }
+
  function streamFrames() {
    if (!exhibitionLayout || (streamedZ !== null && Math.abs(player.z - streamedZ) < .5)) return;
    streamedZ = player.z;
-   const nearby = new Set(nearbyFrames(exhibitionLayout, player.z));
+   const nearby = new Set(architecture
+     ? nearbyFrames(exhibitionLayout, player.z, PHOTO_AHEAD_RADIUS).filter(position => insidePhotoWindow(position))
+     : nearbyFrames(exhibitionLayout, player.z));
    preloadWindow = nearbyFrames(exhibitionLayout, player.z, PRELOAD_RADIUS);
    const retained = new Set(preloadWindow);
    for (const position of requestedPhotos) {
      if (!retained.has(position)) requestedPhotos.delete(position);
    }
    for (const [position, entry] of frames) {
-     if (!nearby.has(position)) unmountFrame(position, entry);
+     if (!nearby.has(position) && (!architecture || !insidePhotoWindow(position, PHOTO_KEEP_MARGIN))) {
+       unmountFrame(position, entry);
+     }
    }
    for (const position of nearby) {
      if (!frames.has(position)) frames.set(position, mountFrame(position));
@@ -369,6 +424,7 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
    if(!architecture)label(room.title, 0, 5.4, -length + .24, 9);
    gold = mat('#b9975b', {metalness:.6, roughness:.35});
    cream = mat('#e5dbc3');
+   if (architecture) mountPermanentFrames(slots);
    portal('Zurück in den Quartalsflügel', 0, 2.4, {type:'wing', q:zone.q, page:zone.page}, Math.PI);
    for (const step of [-1, 1]) {
      const next = zone.room + step;
@@ -398,10 +454,11 @@ if(keys.has('arrowright')){yaw-=dt*1.4;visualDirty=true;}const speed=zone.type==
    const x=T.MathUtils.clamp(player.x+dx,-bounds.x,bounds.x),z=T.MathUtils.clamp(player.z+dz,-bounds.z,bounds.z);
    if(!isArchitectureObstacle(x,player.z))player.x=x;
    if(!isArchitectureObstacle(player.x,z))player.z=z;
- }if(Math.abs(dz)>.005)travelDirection=Math.sign(dz);movementSpeed=Math.hypot(dx,dz)/Math.max(dt,.001);if(avatar){avatar.position.copy(player);if(movementSpeed>.05){const target=Math.atan2(dx,dz),delta=Math.atan2(Math.sin(target-avatar.rotation.y),Math.cos(target-avatar.rotation.y));avatar.rotation.y+=delta*Math.min(1,dt*12);}}
+ }if(Math.abs(dz)>.005&&travelDirection!==Math.sign(dz)){travelDirection=Math.sign(dz);if(architecture)streamedZ=null;}movementSpeed=Math.hypot(dx,dz)/Math.max(dt,.001);if(avatar){avatar.position.copy(player);if(movementSpeed>.05){const target=Math.atan2(dx,dz),delta=Math.atan2(Math.sin(target-avatar.rotation.y),Math.cos(target-avatar.rotation.y));avatar.rotation.y+=delta*Math.min(1,dt*12);}}
  nearest=portals.reduce((best,p)=>Math.hypot(p.x-player.x,p.z-player.z)<4?p:best,null);if(cooldown<=0){const entered=portals.find(p=>Math.hypot(p.x-player.x,p.z-player.z)<1.65);if(entered)navigate(entered.target);}updateCamera();}
  streamFrames();
  warmRoomAtDoor();
+ advancePhotoFades(dt);
  const moving=movementSpeed>.05;
  if(!architecture||visualDirty||moving||wasMoving){
    avatar?.userData.update?.(dt,movementSpeed);
