@@ -8,7 +8,7 @@ import {squirrel} from './squirrel';
 // The app renders nothing when embedded in an unrelated page.
 if(window.top!==window.self){document.documentElement.replaceChildren();throw new Error('Unser Louvre kann nur direkt geöffnet werden.');}
 const app=document.querySelector('#app');
-const wantsNewDesign=new URLSearchParams(window.location.search).get('ansicht')==='neu';
+const wantsNewDesign=new URLSearchParams(window.location.search).get('ansicht')!=='klassisch';
 let museum=null,rows=[],structure={wings:[],exhibitions:[]},isAdmin=false,isDemo=false,active=0,photoRequest=0,sceneVersion=0,loading=false;
 let loginAbort=null;
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
