@@ -8,6 +8,7 @@ import {squirrel} from './squirrel';
 // The app renders nothing when embedded in an unrelated page.
 if(window.top!==window.self){document.documentElement.replaceChildren();throw new Error('Unser Louvre kann nur direkt geöffnet werden.');}
 const app=document.querySelector('#app');
+const wantsNewDesign=new URLSearchParams(window.location.search).get('ansicht')==='neu';
 let museum=null,rows=[],structure={wings:[],exhibitions:[]},isAdmin=false,isDemo=false,active=0,photoRequest=0,sceneVersion=0,loading=false;
 let loginAbort=null;
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -41,7 +42,22 @@ function showWelcome(){
 }
 async function mountGallery(target){const version=++sceneVersion;museum?.dispose();museum=null;renderGallery();
  try{const {createMuseum}=await import('./museum');const host=document.querySelector('#scene');if(version!==sceneVersion||!host)return;
-  museum=createMuseum(host,rows,openPhoto,place=>{const el=document.querySelector('.location');if(el)el.innerHTML=`<span>${escape(place.subtitle)}</span><h2>${escape(place.title)}</h2><p>${escape(place.detail)}</p>`;},{structure,admin:isAdmin,onFrame:frame=>{if(isAdmin)admin.editFrame(frame);}});
+  const onPlace=place=>{
+    const el=document.querySelector('.location');
+    if(el)el.innerHTML=`<span>${escape(place.subtitle)}</span><h2>${escape(place.title)}</h2><p>${escape(place.detail)}</p>`;
+  };
+  const editor={structure,admin:isAdmin,onFrame:frame=>{if(isAdmin)admin.editFrame(frame);}};
+  if(wantsNewDesign){
+    try{
+      const architecture=await import('./museum-architecture');
+      if(version!==sceneVersion||!host.isConnected)return;
+      museum=createMuseum(host,rows,openPhoto,onPlace,{...editor,architecture});
+    }catch(error){
+      if(version!==sceneVersion||!host.isConnected)return;
+      console.warn('Die Testansicht konnte nicht starten. Klassische Ansicht wird geladen.',error);
+    }
+  }
+  museum??=createMuseum(host,rows,openPhoto,onPlace,editor);
   if(target?.exhibitionId){const wings=allWings();const qi=wings.findIndex(q=>q.rooms.some(r=>r.exhibitionId===target.exhibitionId));if(qi>=0){const ri=wings[qi].rooms.findIndex(r=>r.exhibitionId===target.exhibitionId);museum.goRoom(qi,ri,target.frameIndex);}}
   syncPause();
  }catch(error){if(version!==sceneVersion)return;const host=document.querySelector('#scene');if(host)host.innerHTML=`<div class="fallback">Die 3D-Ansicht ist auf diesem Gerät nicht verfügbar.<br>${isAdmin?'Über „Museum gestalten“ kannst du trotzdem alle Rahmen bearbeiten.':'Öffne den Museumsplan, um die Bilder anzusehen.'}</div>`;}
