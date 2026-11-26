@@ -8,6 +8,10 @@ import {createAvatar} from './avatar';
 const PRELOAD_RADIUS = 86;
 const MAX_PHOTO_LOADS = 6;
 const MAX_BACKGROUND_LOADS = 4;
+const ROOM_PREVIEW_RADIUS = 11;
+const ROOM_PREVIEW_PHOTOS = 4;
+const MAX_ROOM_PREVIEW_LOADS = 2;
+const MAX_PREPARED_FRAMES = 6;
 
 export function createMuseum(host,rows,onSelect,onPlace,editor={}){
  const renderer=new T.WebGLRenderer({antialias:true,powerPreference:'high-performance'});renderer.setPixelRatio(editor.architecture?devicePixelRatio:Math.min(devicePixelRatio,1.5));renderer.outputColorSpace=T.SRGBColorSpace;host.append(renderer.domElement);renderer.domElement.tabIndex=0;renderer.domElement.setAttribute('aria-label','Louvre Museum: WASD zum Laufen, ziehen zum Umschauen');
@@ -23,6 +27,8 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
  const textureLoader = new T.TextureLoader();
  let exhibitionLayout = null, gallerySlots = [], streamedZ = null, activeLoads = 0;
  let preloadWindow = [], backgroundLoads = 0;
+ const preparedFrames = new Map(), failedPreviews = new Set();
+ let previewLoads = 0, travelDirection = -1;
  const options={signal:ac.signal},ray=new T.Raycaster();let bounds={x:60,z:50};
  function mat(color,extra={},owned=resources){
    const m=architecture?new T.MeshLambertMaterial({color,map:extra.map??null}):new T.MeshStandardMaterial({color,roughness:.75,...extra});
@@ -156,7 +162,15 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
      material.map = demoTexture(slot.index);
      owned.push(material.map);
    }
-   return {group, art, owned, row, queued: Boolean(row.image_path)};
+   const entry = {group, art, owned, row, queued: Boolean(row.image_path)};
+   const prepared = architecture && preparedFrames.get(row.id);
+   if (prepared?.ready) {
+     preparedFrames.delete(row.id);
+     applyPhoto(entry, prepared.ready);
+     entry.queued = false;
+     requestedPhotos.add(position);
+   }
+   return entry;
  }
 
  function unmountFrame(position, entry) {
@@ -165,17 +179,15 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
    entry.owned.forEach(resource => resource.dispose());
  }
 
- async function loadFramePhoto(position, entry) {
-   entry.queued = false;
-   requestedPhotos.add(position);
-   activeLoads++;
-   const isCurrent = () => frames.get(position) === entry;
-   let texture;
+ async function preparePhoto(row, isCurrent) {
+   const url = await getPhoto(row);
+   if (!isCurrent()) return null;
+   const texture = await textureLoader.loadAsync(url);
+   if (!isCurrent()) {
+     texture.dispose();
+     return null;
+   }
    try {
-     const url = await getPhoto(entry.row);
-     if (!isCurrent()) return;
-     texture = await textureLoader.loadAsync(url);
-     if (!isCurrent()) return;
      const {width, height} = texture.image;
      const scale = Math.min(1, 640 / Math.max(width, height));
      if (scale < 1) {
@@ -187,21 +199,101 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
      }
      texture.colorSpace = T.SRGBColorSpace;
      texture.needsUpdate = true;
-     entry.owned.push(texture);
-     const {art} = entry;
-     art.material.map = texture;
-     art.material.needsUpdate = true;
-     visualDirty = true;
-     const ratio = width / height / 1.325;
-     art.scale.set(Math.min(1, ratio), Math.min(1, 1 / ratio), 1);
-     texture = null;
+     return {texture, ratio: width / height / 1.325};
+   } catch (error) {
+     texture.dispose();
+     throw error;
+   }
+ }
+
+ function applyPhoto(entry, photo) {
+   const {art} = entry;
+   entry.owned.push(photo.texture);
+   art.material.map = photo.texture;
+   art.material.needsUpdate = true;
+   art.scale.set(Math.min(1, photo.ratio), Math.min(1, 1 / photo.ratio), 1);
+   visualDirty = true;
+ }
+
+ function warmRoomAtDoor() {
+   if (!architecture || disposed || paused || (zone.type !== 'wing' && zone.type !== 'room')) return;
+   if (previewLoads >= MAX_ROOM_PREVIEW_LOADS || activeLoads + backgroundLoads + previewLoads >= MAX_PHOTO_LOADS) return;
+   let candidate, bestDistance = ROOM_PREVIEW_RADIUS;
+   for (const portal of portals) {
+     if (portal.target.type !== 'room') continue;
+     const distance = Math.hypot(portal.x - player.x, portal.z - player.z);
+     if (distance < bestDistance) {
+       candidate = portal.target;
+       bestDistance = distance;
+     }
+   }
+   if (!candidate) return;
+   const slots = groups[candidate.q].rooms[candidate.room].slots.slice(0, ROOM_PREVIEW_PHOTOS);
+   const candidates = new Set(slots.map(slot => rows[slot.index]?.id));
+   for (const slot of slots) {
+     if (previewLoads >= MAX_ROOM_PREVIEW_LOADS || activeLoads + backgroundLoads + previewLoads >= MAX_PHOTO_LOADS) break;
+     const row = rows[slot.index];
+     if (!row?.image_path || preparedFrames.has(row.id) || failedPreviews.has(row.id)) continue;
+     if (preparedFrames.size >= MAX_PREPARED_FRAMES) {
+       const oldestReady = [...preparedFrames].find(([id, item]) => item.ready && !candidates.has(id));
+       if (!oldestReady) break;
+       preparedFrames.delete(oldestReady[0]);
+       oldestReady[1].ready.texture.dispose();
+     }
+     const item = {ready: null, claimed: false, promise: null};
+     preparedFrames.set(row.id, item);
+     previewLoads++;
+     item.promise = preparePhoto(row, () => !disposed && (item.claimed || preparedFrames.get(row.id) === item))
+       .then(photo => {
+         if (!photo) return null;
+         item.ready = photo;
+         if (!item.claimed) renderer.initTexture(photo.texture);
+         return photo;
+       })
+       .catch(() => {
+         item.ready?.texture.dispose();
+         item.ready = null;
+         failedPreviews.add(row.id);
+         if (preparedFrames.get(row.id) === item) preparedFrames.delete(row.id);
+         return null;
+       })
+       .finally(() => {previewLoads--;schedulePhotos();});
+   }
+ }
+
+ async function loadFramePhoto(position, entry) {
+   entry.queued = false;
+   requestedPhotos.add(position);
+   activeLoads++;
+   const isCurrent = () => frames.get(position) === entry;
+   let photo;
+   try {
+     const prepared = architecture && preparedFrames.get(entry.row.id);
+     if (prepared) {
+       prepared.claimed = true;
+       preparedFrames.delete(entry.row.id);
+       photo = await prepared.promise;
+     }
+     if (!photo && isCurrent()) photo = await preparePhoto(entry.row, isCurrent);
+     if (!photo || !isCurrent()) return;
+     applyPhoto(entry, photo);
+     photo = null;
    } catch {
      if (isCurrent()) {entry.art.material.color.set('#a86b56');visualDirty=true;}
    } finally {
-     texture?.dispose();
+     photo?.texture.dispose();
      activeLoads--;
      schedulePhotos();
    }
+ }
+
+ function orderedForTravel(positions) {
+   if (!architecture) return positions;
+   const cost = position => {
+     const delta = exhibitionLayout.slots[position].z - player.z;
+     return Math.abs(delta) + (delta * travelDirection < 0 ? 8 : 0);
+   };
+   return [...positions].sort((a,b) => cost(a) - cost(b));
  }
 
  async function preloadPhoto(position, row) {
@@ -219,14 +311,14 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
 
  function schedulePhotos() {
    if (!exhibitionLayout || disposed) return;
-   for (const position of nearbyFrames(exhibitionLayout, player.z)) {
-     if (activeLoads + backgroundLoads >= MAX_PHOTO_LOADS) return;
+   for (const position of orderedForTravel(nearbyFrames(exhibitionLayout, player.z))) {
+     if (activeLoads + backgroundLoads + previewLoads >= MAX_PHOTO_LOADS) return;
      const entry = frames.get(position);
      if (entry?.queued) void loadFramePhoto(position, entry);
    }
    if (paused) return;
-   for (const position of preloadWindow) {
-     if (activeLoads + backgroundLoads >= MAX_PHOTO_LOADS || backgroundLoads >= MAX_BACKGROUND_LOADS) return;
+   for (const position of orderedForTravel(preloadWindow)) {
+     if (activeLoads + backgroundLoads + previewLoads >= MAX_PHOTO_LOADS || backgroundLoads >= MAX_BACKGROUND_LOADS) return;
      if (requestedPhotos.has(position)) continue;
      const row = rows[gallerySlots[position].index];
      if (row.image_path) void preloadPhoto(position, row);
@@ -290,7 +382,7 @@ export function createMuseum(host,rows,onSelect,onPlace,editor={}){
    onPlace({title:room.title, subtitle:`${q.months.toUpperCase()} · AUSSTELLUNG ${zone.room+1} / ${q.rooms.length}`,
      detail:room.indices.length ? `${room.indices.length} Bilder · Foto antippen` : 'Diese Ausstellung wartet auf eure Fotos.', zone:'room'});
  }
- function navigate(target){visualDirty=true;clearFrames();avatar?.userData.dispose?.();avatar=null;resources.forEach(r=>r.dispose());resources=[];portals=[];pictures=[];zone=target;scene=new T.Scene();scene.background=new T.Color('#9caeac');scene.add(new T.HemisphereLight('#fff4d8','#596466',2.6));const sun=new T.DirectionalLight('#ffe8b6',2.2);sun.position.set(20,35,15);scene.add(sun);pitch=cameraMode==='third'?.18:0;joy={x:0,y:0};keys.clear();nearest=null;cooldown=1.2;if(target.type==='outside')(architecture?themedOutside:outside)();else if(target.type==='hub')(architecture?themedHub:hub)();else if(target.type==='wing')(architecture?themedWing:wing)();else exhibition();if(architecture&&target.type==='outside'&&cameraMode==='third')pitch=.095;player.set(camera.position.x,0,camera.position.z);addAvatar();updateCamera();streamFrames();}
+ function navigate(target){visualDirty=true;travelDirection=-1;clearFrames();avatar?.userData.dispose?.();avatar=null;resources.forEach(r=>r.dispose());resources=[];portals=[];pictures=[];zone=target;scene=new T.Scene();scene.background=new T.Color('#9caeac');scene.add(new T.HemisphereLight('#fff4d8','#596466',2.6));const sun=new T.DirectionalLight('#ffe8b6',2.2);sun.position.set(20,35,15);scene.add(sun);pitch=cameraMode==='third'?.18:0;joy={x:0,y:0};keys.clear();nearest=null;cooldown=1.2;if(target.type==='outside')(architecture?themedOutside:outside)();else if(target.type==='hub')(architecture?themedHub:hub)();else if(target.type==='wing')(architecture?themedWing:wing)();else exhibition();if(architecture&&target.type==='outside'&&cameraMode==='third')pitch=.095;player.set(camera.position.x,0,camera.position.z);addAvatar();updateCamera();streamFrames();}
  function reset(){keys.clear();joy={x:0,y:0};drag=null;}
  window.addEventListener('keydown',e=>{if(isInteractiveTarget(e.target))return;if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key))e.preventDefault();keys.add(e.key.toLowerCase());if(e.key.toLowerCase()==='e'&&!paused&&nearest)navigate(nearest.target);},options);window.addEventListener('keyup',e=>{if(isInteractiveTarget(e.target))return;keys.delete(e.key.toLowerCase());},options);window.addEventListener('blur',reset,options);document.addEventListener('visibilitychange',reset,options);
  const canvas=renderer.domElement;canvas.addEventListener('pointerdown',e=>{drag={id:e.pointerId,x:e.clientX,y:e.clientY,sx:e.clientX,sy:e.clientY};canvas.setPointerCapture(e.pointerId);},options);canvas.addEventListener('pointermove',e=>{if(!drag||drag.id!==e.pointerId||paused)return;yaw-=(e.clientX-drag.x)*.0035;const limit=cameraMode==='third'?[-.25,.9]:[-1.2,1.25];pitch=T.MathUtils.clamp(pitch-(e.clientY-drag.y)*.0035,...limit);drag.x=e.clientX;drag.y=e.clientY;visualDirty=true;},options);canvas.addEventListener('pointerup',e=>{if(drag&&!paused&&Math.hypot(e.clientX-drag.sx,e.clientY-drag.sy)<8){const r=canvas.getBoundingClientRect();ray.setFromCamera(new T.Vector2((e.clientX-r.left)/r.width*2-1,1-(e.clientY-r.top)/r.height*2),camera);const hit=ray.intersectObjects(pictures)[0];if(hit){if(editor.admin)editor.onFrame?.(hit.object.userData.frame);else onSelect(hit.object.userData.index);}}drag=null;},options);canvas.addEventListener('pointercancel',()=>drag=null,options);
@@ -306,9 +398,10 @@ if(keys.has('arrowright')){yaw-=dt*1.4;visualDirty=true;}const speed=zone.type==
    const x=T.MathUtils.clamp(player.x+dx,-bounds.x,bounds.x),z=T.MathUtils.clamp(player.z+dz,-bounds.z,bounds.z);
    if(!isArchitectureObstacle(x,player.z))player.x=x;
    if(!isArchitectureObstacle(player.x,z))player.z=z;
- }movementSpeed=Math.hypot(dx,dz)/Math.max(dt,.001);if(avatar){avatar.position.copy(player);if(movementSpeed>.05){const target=Math.atan2(dx,dz),delta=Math.atan2(Math.sin(target-avatar.rotation.y),Math.cos(target-avatar.rotation.y));avatar.rotation.y+=delta*Math.min(1,dt*12);}}
+ }if(Math.abs(dz)>.005)travelDirection=Math.sign(dz);movementSpeed=Math.hypot(dx,dz)/Math.max(dt,.001);if(avatar){avatar.position.copy(player);if(movementSpeed>.05){const target=Math.atan2(dx,dz),delta=Math.atan2(Math.sin(target-avatar.rotation.y),Math.cos(target-avatar.rotation.y));avatar.rotation.y+=delta*Math.min(1,dt*12);}}
  nearest=portals.reduce((best,p)=>Math.hypot(p.x-player.x,p.z-player.z)<4?p:best,null);if(cooldown<=0){const entered=portals.find(p=>Math.hypot(p.x-player.x,p.z-player.z)<1.65);if(entered)navigate(entered.target);}updateCamera();}
  streamFrames();
+ warmRoomAtDoor();
  const moving=movementSpeed>.05;
  if(!architecture||visualDirty||moving||wasMoving){
    avatar?.userData.update?.(dt,movementSpeed);
@@ -318,5 +411,5 @@ if(keys.has('arrowright')){yaw-=dt*1.4;visualDirty=true;}const speed=zone.type==
  wasMoving=moving;
  frame=requestAnimationFrame(tick);}
  frame=requestAnimationFrame(tick);
- return {setJoystick(x,y){joy={x,y};},toggleCamera(){visualDirty=true;cameraMode=cameraMode==='third'?'pov':'third';pitch=cameraMode==='third'?.18:0;if(avatar)avatar.visible=cameraMode==='third'&&avatarVisible;updateCamera();return cameraMode;},setAvatarVisible(v){visualDirty=true;avatarVisible=v;if(avatar)avatar.visible=cameraMode==='third'&&v;},pause(v){paused=v;reset();if(!paused)schedulePhotos();},home(){navigate({type:'hub'});},outside(){navigate({type:'outside'});},goQuarter(q){navigate({type:'wing',q,page:0});},goRoom(q,room,frameIndex){navigate({type:'room',q,room,frameIndex,page:Math.floor(room/8)});},dispose(){disposed=true;clearFrames();cancelAnimationFrame(frame);ac.abort();observer.disconnect();clearTimeout(resizeTimer);avatar?.userData.dispose?.();resources.forEach(r=>r.dispose());renderer.dispose();canvas.remove();}};
+ return {setJoystick(x,y){joy={x,y};},toggleCamera(){visualDirty=true;cameraMode=cameraMode==='third'?'pov':'third';pitch=cameraMode==='third'?.18:0;if(avatar)avatar.visible=cameraMode==='third'&&avatarVisible;updateCamera();return cameraMode;},setAvatarVisible(v){visualDirty=true;avatarVisible=v;if(avatar)avatar.visible=cameraMode==='third'&&v;},pause(v){paused=v;reset();if(!paused)schedulePhotos();},home(){navigate({type:'hub'});},outside(){navigate({type:'outside'});},goQuarter(q){navigate({type:'wing',q,page:0});},goRoom(q,room,frameIndex){navigate({type:'room',q,room,frameIndex,page:Math.floor(room/8)});},dispose(){disposed=true;for(const item of preparedFrames.values())item.ready?.texture.dispose();preparedFrames.clear();clearFrames();cancelAnimationFrame(frame);ac.abort();observer.disconnect();clearTimeout(resizeTimer);avatar?.userData.dispose?.();resources.forEach(r=>r.dispose());renderer.dispose();canvas.remove();}};
 }
